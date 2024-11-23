@@ -1,6 +1,4 @@
-image1.jpeg
-video1.mp4
-video2.mp4
-video3.mp4
-video4.mp4
-2GB.zip
+file1.txt
+file2.txt
+image.jpg
+1GB.bin
