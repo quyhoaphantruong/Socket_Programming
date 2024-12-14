@@ -1,149 +1,90 @@
-package client.client;
 import java.io.*;
 import java.net.*;
-import java.util.*;
+import java.util.concurrent.*;
 
-/**
- * The ClientHandler class processes requests from a connected client.
- */
-class ClientHandler implements Runnable {
+public class FileClient {
+    private static final String SERVER_IP = "192.168.100.108";
+    private static final int PORT = 12345;
+    private static final long CHECK_INTERVAL_MS = 5000;
 
-    private Socket clientSocket;
-    private Map<String, Long> fileList;
-    private DataInputStream dis;
-    private DataOutputStream dos;
+    private volatile boolean running = true;
+    private BlockingQueue<String> filesToDownload = new LinkedBlockingQueue<>();
+    private ConcurrentHashMap<String, Long> fileToSize = new ConcurrentHashMap<>();
 
-    public ClientHandler(Socket socket, Map<String, Long> fileList) {
-        this.clientSocket = socket;
-        this.fileList = fileList;
+    public static void main(String[] args) {
+        new FileClient().start();
     }
 
-    @Override
-    public void run() {
-        try {
-            dis = new DataInputStream(clientSocket.getInputStream());
-            dos = new DataOutputStream(clientSocket.getOutputStream());
+    public void start() {
+        displayAvailableFiles();
+        
+        InputFileWatcher inputWatcher = new InputFileWatcher("input.txt", filesToDownload);
+        ScheduledExecutorService scheduler = Executors.newSingleThreadScheduledExecutor();
+        ExecutorService downloadExecutor = Executors.newSingleThreadExecutor();
+        ExecutorService chunkExecutor = Executors.newFixedThreadPool(5);
 
-            while (true) {
-                String command = dis.readUTF();
-                System.out.println("Received command: " + command);
+        
+        Runtime.getRuntime().addShutdownHook(new Thread(() -> {
+            System.out.println("Shutting down client...");
+            running = false;
+            scheduler.shutdown();
+            downloadExecutor.shutdown();
+        }));
 
-                if (command.equals("LIST_FILES")) {
-                    handleListFiles();
-                } else if (command.startsWith("GET_CHUNK")) {
-                    handleGetChunk(command);
-                } else if (command.equals("QUIT")) {
-                    System.out.println("Client requested to quit.");
-                    break;
-                } else {
-                    dos.writeUTF("ERROR Unknown command");
+        // Schedule the input watcher to check for new files every 5 seconds
+        scheduler.scheduleAtFixedRate(() -> {
+            if (running) {
+                inputWatcher.checkForNewFiles();
+                String fileName;
+                while ((fileName = filesToDownload.poll()) != null) {
+                    downloadExecutor.submit(new FileDownloader(fileName, SERVER_IP, PORT, fileToSize, chunkExecutor));
                 }
             }
-        } catch (IOException e) {
-            System.out.println("Client disconnected: " + clientSocket.getRemoteSocketAddress());
-        } finally {
-            closeConnections();
-        }
-    }
+        }, 0, CHECK_INTERVAL_MS, TimeUnit.MILLISECONDS);
 
-    /**
-     * Handles the LIST_FILES command by sending the list of available files to the client.
-     */
-    private void handleListFiles() throws IOException {
-        // Convert fileList to a string representation
-        StringBuilder sb = new StringBuilder();
-        for (Map.Entry<String, Long> entry : fileList.entrySet()) {
-            sb.append(entry.getKey()).append(" ").append(entry.getValue()).append("\n");
-        }
-
-        dos.writeUTF(sb.toString());
-        dos.flush();
-        System.out.println("Sent file list to client.");
-    }
-
-    /**
-     * Handles the GET_CHUNK command by sending the requested file chunk to the client.
-     *
-     * @param command The command string containing file name and chunk details.
-     */
-    private void handleGetChunk(String command) throws IOException {
-        // Command format: GET_CHUNK filename start size
-        String[] tokens = command.split(" ", 4);
-        if (tokens.length != 4) {
-            dos.writeUTF("ERROR Invalid GET_CHUNK command");
-            return;
-        }
-
-        String filename = tokens[1];
-        long start;
-        long size;
-
-        try {
-            start = Long.parseLong(tokens[2]);
-            size = Long.parseLong(tokens[3]);
-        } catch (NumberFormatException e) {
-            dos.writeUTF("ERROR Invalid start or size");
-            return;
-        }
-
-        if (!fileList.containsKey(filename)) {
-            dos.writeUTF("ERROR File not found");
-            return;
-        }
-
-        File file = new File(filename);
-        if (!file.exists()) {
-            dos.writeUTF("ERROR File not found on server");
-            return;
-        }
-
-        long fileSize = file.length();
-        if (start < 0 || start >= fileSize) {
-            dos.writeUTF("ERROR Invalid start position");
-            return;
-        }
-
-        if (start + size > fileSize) {
-            size = fileSize - start; // Adjust size if it exceeds file length
-        }
-
-        dos.writeUTF("OK"); // Acknowledge that the request is valid
-        dos.flush();
-
-        // Send the file chunk to the client
-        try (RandomAccessFile raf = new RandomAccessFile(file, "r")) {
-            raf.seek(start);
-
-            byte[] buffer = new byte[4096];
-            long bytesToSend = size;
-
-            while (bytesToSend > 0) {
-                int bytesRead = raf.read(buffer, 0, (int) Math.min(buffer.length, bytesToSend));
-                if (bytesRead == -1) break;
-
-                dos.write(buffer, 0, bytesRead);
-                bytesToSend -= bytesRead;
+        // Keep the main thread alive
+        while (running) {
+            try {
+                Thread.sleep(1000);
+            } catch (InterruptedException e) {
+                running = false;
             }
+        }
 
+        scheduler.shutdown();
+    }
+
+    private void displayAvailableFiles() {
+        try (Socket socket = new Socket(SERVER_IP, PORT);
+             DataInputStream dis = new DataInputStream(socket.getInputStream());
+             DataOutputStream dos = new DataOutputStream(socket.getOutputStream())) {
+
+            dos.writeUTF("LIST_FILES");
             dos.flush();
-            System.out.println("Sent chunk of file '" + filename + "' to client.");
+
+            String fileList = dis.readUTF();
+            saveFileSize(fileList);
+            System.out.println("Available files:");
+            System.out.println(fileList);
+
         } catch (IOException e) {
-            dos.writeUTF("ERROR Sending chunk");
-            System.err.println("Error sending file chunk: " + e.getMessage());
+            System.err.println("Error retrieving file list: " + e.getMessage());
         }
     }
 
-    /**
-     * Closes the connections and streams associated with the client.
-     */
-    private void closeConnections() {
-        try {
-            if (dis != null) dis.close();
-            if (dos != null) dos.close();
-            if (clientSocket != null && !clientSocket.isClosed()) clientSocket.close();
-            System.out.println("Closed connection with client.");
-        } catch (IOException e) {
-            System.err.println("Error closing connections: " + e.getMessage());
+    private void saveFileSize(String fileList) {
+        String[] files = fileList.split("\n");
+        for (String file : files) {
+            String[] parts = file.trim().split(" ");
+            if (parts.length == 2) {
+                try {
+                    fileToSize.put(parts[0], Long.parseLong(parts[1]));
+                } catch (NumberFormatException e) {
+                    System.err.println("Invalid file size format for file: " + parts[0]);
+                }
+            } else {
+                System.err.println("Skipping malformed file entry: " + file);
+            }
         }
     }
 }
